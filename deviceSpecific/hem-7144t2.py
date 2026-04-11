@@ -21,6 +21,7 @@ class deviceSpecificDriver(sharedDeviceDriverCode):
     #AsettingsTimeSyncBytes           = [0x14, 0x1e]
 
     def deviceSpecific_ParseRecordFormat(self, singleRecordAsByteArray):
+        logger.debug(f"raw hex: {bytes(singleRecordAsByteArray).hex()}")
         recordDict             = dict()
         recordDict["mov"]      = 0
         recordDict["ihb"]      = 0
@@ -29,11 +30,13 @@ class deviceSpecificDriver(sharedDeviceDriverCode):
         recordDict["bpm"]      = self._bytearrayBitsToInt(singleRecordAsByteArray, 16, 23)
         year                   = self._bytearrayBitsToInt(singleRecordAsByteArray, 24, 31) + 2000
         month                  = self._bytearrayBitsToInt(singleRecordAsByteArray, 32, 35)
-        day                    = self._bytearrayBitsToInt(singleRecordAsByteArray, 36, 40)
-        hour                   = self._bytearrayBitsToInt(singleRecordAsByteArray, 41, 45)
-        minute                 = self._bytearrayBitsToInt(singleRecordAsByteArray, 50, 55)
-        second                 = self._bytearrayBitsToInt(singleRecordAsByteArray, 56, 61)
+        # bits 36-42 reserved/unknown
+        day                    = self._bytearrayBitsToInt(singleRecordAsByteArray, 43, 47)
+        hour                   = self._bytearrayBitsToInt(singleRecordAsByteArray, 48, 52)
+        minute                 = self._bytearrayBitsToInt(singleRecordAsByteArray, 53, 58)
+        second                 = self._bytearrayBitsToInt(singleRecordAsByteArray, 59, 63)
         second                 = min([second, 59])
+        logger.debug(f"parsed: sys={recordDict['sys']} dia={recordDict['dia']} bpm={recordDict['bpm']} date={year}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}:{second:02d}")
         recordDict["datetime"] = datetime.datetime(year, month, day, hour, minute, second)
         return recordDict
 

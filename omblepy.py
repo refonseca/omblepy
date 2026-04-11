@@ -198,8 +198,14 @@ class bluetoothTxRxHandler:
         await bleClient.start_notify(self.deviceUnlock_UUID, self._callbackForUnlockChannel)
         self.rxFinishedFlag = False
         await bleClient.write_gatt_char(self.deviceUnlock_UUID, b'\x01' + keyByteArray, response=True)
+        timeout = 2.0
         while(self.rxFinishedFlag == False):
             await asyncio.sleep(0.1)
+            timeout -= 0.1
+            if timeout < 0:
+                logger.warning("No unlock response from device (may be normal for some models), continuing.")
+                await bleClient.stop_notify(self.deviceUnlock_UUID)
+                return
         deviceResponse = self.rxDataBytes
         if(deviceResponse[:2] !=  bytearray.fromhex("8100")):
             raise ValueError(f"entered pairing key does not match stored one.")
@@ -320,7 +326,13 @@ async def main():
         logger.info(f"Attempt connecting to {bleAddr}.")
         await bleClient.connect()
         await asyncio.sleep(0.5)
-        await bleClient.pair(protection_level = 2)
+        try:
+            await bleClient.pair(protection_level = 2)
+        except Exception as e:
+            if "OPERATION_ALREADY_IN_PROGRESS" in str(e) or "already" in str(e).lower():
+                logger.info("Device already paired, continuing.")
+            else:
+                raise
         #verify that the device is an omron device by checking presence of certain bluetooth services
         if parentService_UUID not in [service.uuid for service in bleClient.services]:
             raise OSError("""Some required bluetooth attributes not found on this ble device.
