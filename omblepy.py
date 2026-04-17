@@ -234,14 +234,23 @@ def appendCsv(allRecords):
             allRecords[userIdx].extend(filter(lambda x: x["datetime"] not in datesOfNewRecords,records))
         allRecords[userIdx] = sorted(allRecords[userIdx], key = lambda x: x["datetime"])
         logger.info(f"writing data to user{userIdx+1}.csv")
+        if allRecords[userIdx]:
+            first_keys = list(allRecords[userIdx][0].keys())
+            csv_fieldnames = ["datetime"] + [k for k in first_keys if k != "datetime"]
+        else:
+            csv_fieldnames = ["datetime", "dia", "sys", "bpm", "mov", "ihb"]
         with open(f"user{userIdx+1}.csv", mode='w', newline='', encoding='utf-8') as outfile:
-            writer = csv.DictWriter(outfile, fieldnames = ["datetime", "dia", "sys", "bpm", "mov", "ihb"])
+            writer = csv.DictWriter(outfile, fieldnames=csv_fieldnames, extrasaction='ignore')
             writer.writeheader()
             for recordDict in allRecords[userIdx]:
                 recordDict["datetime"] = recordDict["datetime"].strftime("%Y-%m-%d %H:%M:%S")
                 writer.writerow(recordDict)
 
 def saveUBPMJson(allRecords):
+    has_bp = any('sys' in rec for user in allRecords for rec in user)
+    if not has_bp:
+        logger.info("Device does not produce blood-pressure records; skipping UBPM JSON.")
+        return
     f = pathlib.Path(f"ubpm.json")
     UBPM = {}
     UBPM["UBPM"] = {}
@@ -254,6 +263,73 @@ def saveUBPMJson(allRecords):
                                 'time': recdate.strftime("%H:%M:%S"), 'msg': "",
                                 'sys': int(rec['sys']), 'dia': int(rec['dia']), 'bpm': int(rec['bpm']), 'ihb': int(rec['ihb']), 'mov': int(rec['mov']) })
     f.write_text(json.dumps(UBPM, indent=4, sort_keys=True, default=str))
+
+_LINUX_AGENT_PATH = '/omblepy/BleAgent'
+
+async def _linux_register_pairing_agent():
+    """
+    Register a BlueZ D-Bus NoInputNoOutput pairing agent before connecting.
+
+    The HEM-7144T2 sends a Security Request within ~90 ms of connection.  BlueZ responds
+    immediately with a SMP Pairing Request whose IO capability is taken from the currently
+    registered agent.  With no agent (or the default DisplayYesNo), BlueZ generates a
+    User Confirmation Request that nobody answers, and the device disconnects after ~30 s.
+
+    By registering a NoInputNoOutput agent BEFORE connect(), we make BlueZ advertise
+    IO capability NoInputNoOutput in the Pairing Request.  Combined with the device's own
+    NoInputNoOutput, the negotiated method is Just Works with no confirmation step, so the
+    SMP exchange and LTK encryption complete automatically.
+
+    Returns the D-Bus bus object (for cleanup) or None if unavailable.
+    """
+    try:
+        from dbus_fast.aio import MessageBus
+        from dbus_fast.service import ServiceInterface, method as dbus_method
+        from dbus_fast import BusType
+    except ImportError:
+        try:
+            from dbus_next.aio import MessageBus
+            from dbus_next.service import ServiceInterface, method as dbus_method
+            from dbus_next import BusType
+        except ImportError:
+            logger.warning("dbus_fast/dbus_next not found; cannot register BlueZ pairing agent.")
+            return None
+
+    class _JustWorksAgent(ServiceInterface):
+        """Minimal BlueZ Agent1 that silently accepts Just Works (NoInputNoOutput) pairing."""
+        def __init__(self):
+            super().__init__('org.bluez.Agent1')
+        @dbus_method()
+        def Release(self): pass
+        @dbus_method()
+        def RequestPinCode(self, device: 'o') -> 's': return '0000'
+        @dbus_method()
+        def DisplayPinCode(self, device: 'o', pincode: 's'): pass
+        @dbus_method()
+        def RequestPasskey(self, device: 'o') -> 'u': return 0
+        @dbus_method()
+        def DisplayPasskey(self, device: 'o', passkey: 'u', entered: 'q'): pass
+        @dbus_method()
+        def RequestConfirmation(self, device: 'o', passkey: 'u'): pass
+        @dbus_method()
+        def RequestAuthorization(self, device: 'o'): pass
+        @dbus_method()
+        def AuthorizeService(self, device: 'o', uuid: 's'): pass
+        @dbus_method()
+        def Cancel(self): pass
+
+    try:
+        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+        bus.export(_LINUX_AGENT_PATH, _JustWorksAgent())
+        intro = await bus.introspect('org.bluez', '/org/bluez')
+        mgr   = bus.get_proxy_object('org.bluez', '/org/bluez', intro).get_interface('org.bluez.AgentManager1')
+        await mgr.call_register_agent(_LINUX_AGENT_PATH, 'NoInputNoOutput')
+        await mgr.call_request_default_agent(_LINUX_AGENT_PATH)
+        logger.info("Linux/BlueZ: NoInputNoOutput pairing agent registered.")
+        return bus
+    except Exception as e:
+        logger.warning(f"Could not register BlueZ pairing agent: {e}")
+        return None
 
 async def selectBLEdevices():
     print("Select your Omron device from the list below...")
@@ -298,7 +374,10 @@ async def main():
         return
     if(args.device):
         deviceName = args.device.strip("'").strip('\"') #strip quotes around arg
-        sys.path.insert(0, "./deviceSpecific")
+        if getattr(sys, 'frozen', False):
+            sys.path.insert(0, str(pathlib.Path(sys._MEIPASS) / "deviceSpecific"))
+        else:
+            sys.path.insert(0, "./deviceSpecific")
         try:
             logger.info(f"Attempt to import module for device {deviceName.lower()}")
             deviceSpecific = __import__(deviceName.lower())
@@ -322,25 +401,52 @@ async def main():
         bleAddr = await selectBLEdevices()
 
     bleClient = bleak.BleakClient(bleAddr)
+    _linux_agent_bus = None
     try:
+        if sys.platform == "linux":
+            # Register NoInputNoOutput agent BEFORE connecting so BlueZ uses it when the
+            # device sends its Security Request (~90 ms after connection).  This prevents
+            # the User Confirmation Request that otherwise blocks Just Works pairing.
+            _linux_agent_bus = await _linux_register_pairing_agent()
         logger.info(f"Attempt connecting to {bleAddr}.")
         await bleClient.connect()
-        await asyncio.sleep(0.5)
-        try:
-            await bleClient.pair(protection_level = 2)
-        except Exception as e:
-            if "OPERATION_ALREADY_IN_PROGRESS" in str(e) or "already" in str(e).lower():
-                logger.info("Device already paired, continuing.")
-            else:
-                raise
+        # Allow time for the SMP exchange (triggered by the device's Security Request) to
+        # complete now that the NoInputNoOutput agent is registered.
+        # On some systems (like Raspberry Pi 5), GATT service discovery can take a bit longer.
+        await asyncio.sleep(2.0)
+        if sys.platform != "linux":
+            try:
+                await bleClient.pair(protection_level = 2)
+            except Exception as e:
+                if "OPERATION_ALREADY_IN_PROGRESS" in str(e) or "already" in str(e).lower():
+                    logger.info("Device already paired, continuing.")
+                else:
+                    raise
+        
         #verify that the device is an omron device by checking presence of certain bluetooth services
-        if parentService_UUID not in [service.uuid for service in bleClient.services]:
-            raise OSError("""Some required bluetooth attributes not found on this ble device.
-                             This means that either, you connected to a wrong device,
-                             or that your OS has a bug when reading BT LE device attributes (certain linux versions).""")
-            return
+        found_services = []
+        for i in range(5):
+            found_services = [service.uuid for service in bleClient.services]
+            if parentService_UUID in found_services:
+                break
+            logger.info(f"Waiting for Omron service {parentService_UUID} (found {len(found_services)} services so far)...")
+            await asyncio.sleep(1.0)
+
+        if parentService_UUID not in found_services:
+            logger.error(f"Required Omron service {parentService_UUID} not found.")
+            logger.error(f"Discovered services: {found_services}")
+            if deviceSpecific is not None:
+                logger.warning(f"Proceeding anyway as a specific device driver ({deviceName}) is loaded and might use direct handles.")
+            else:
+                raise OSError(f"""Some required bluetooth attributes not found on this ble device.
+                                 Expected service {parentService_UUID} not found.
+                                 This means that either, you connected to a wrong device,
+                                 or that your OS has a bug when reading BT LE device attributes (certain linux versions).""")
+
         bluetoothTxRxObj = bluetoothTxRxHandler()
         if(args.pair):
+            if deviceName.lower().startswith("hbf"):
+                logger.info("Pairing (-p) for HBF scales typically uses a fixed key handled by the driver transport.")
             await bluetoothTxRxObj.writeNewUnlockKey()
             #this seems to be necessary when the device has not been paired to any device
             await bluetoothTxRxObj.startTransmission()
@@ -353,14 +459,25 @@ async def main():
             appendCsv(allRecs)
             saveUBPMJson(allRecs)
     finally:
+        if _linux_agent_bus is not None:
+            try:
+                _linux_agent_bus.disconnect()
+            except Exception:
+                pass
         logger.info("unpair and disconnect")
         if bleClient.is_connected:
-            await bleClient.unpair()
+            try:
+                await bleClient.unpair()
+            except Exception as e:
+                logger.debug(f"Unpair failed (normal if not supported by OS): {e}")
+            
             try:
                 await bleClient.disconnect()
             except AssertionError as e:
                 logger.error("Bleak AssertionError during disconnect. This usually happens when using the bluezdbus adapter.")
                 logger.error("You can find the upstream issue at: https://github.com/hbldh/bleak/issues/641")
                 logger.error(f"AssertionError details: {e}")
+            except Exception as e:
+                logger.error(f"Disconnect failed: {e}")
 
 asyncio.run(main())
