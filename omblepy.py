@@ -11,7 +11,10 @@ import csv
 import json
 
 #global constants
-parentService_UUID        = "0000fe4a-0000-1000-8000-00805f9b34fb"
+parentService_UUIDs        = [
+    "0000fe4a-0000-1000-8000-00805f9b34fb",
+    "ecbe3980-c9a2-11e1-b1bd-0002a5d5c51b" # Found on HBF-222T
+]
 
 #global variables
 bleClient           = None
@@ -26,7 +29,10 @@ def convertByteArrayToHexString(array):
 class bluetoothTxRxHandler:
     #BTLE Characteristic IDs
     deviceRxChannelUUIDs  = [
-                                "49123040-aee8-11e1-a74d-0002a5d5c51b"
+                                "49123040-aee8-11e1-a74d-0002a5d5c51b",
+                                "4d0bf320-aee8-11e1-a0d9-0002a5d5c51b",
+                                "5128ce60-aee8-11e1-b84b-0002a5d5c51b",
+                                "560f1420-aee8-11e1-8184-0002a5d5c51b"
                             ]
     deviceTxChannelUUIDs  = [
                                 "db5b55e0-aee7-11e1-965e-0002a5d5c51b"
@@ -44,13 +50,20 @@ class bluetoothTxRxHandler:
     async def _enableRxChannelNotifyAndCallback(self):
         if(self.currentRxNotifyStateFlag != True):
             for rxChannelUUID in self.deviceRxChannelUUIDs:
-                await bleClient.start_notify(rxChannelUUID, self._callbackForRxChannels)
+                if bleClient.services.get_characteristic(rxChannelUUID):
+                    await bleClient.start_notify(rxChannelUUID, self._callbackForRxChannels)
+                else:
+                    logger.debug(f"Characteristic {rxChannelUUID} not found, skipping notify.")
             self.currentRxNotifyStateFlag = True
 
     async def _disableRxChannelNotifyAndCallback(self):
         if(self.currentRxNotifyStateFlag != False):
             for rxChannelUUID in self.deviceRxChannelUUIDs:
-                await bleClient.stop_notify(rxChannelUUID)
+                if bleClient.services.get_characteristic(rxChannelUUID):
+                    try:
+                        await bleClient.stop_notify(rxChannelUUID)
+                    except Exception:
+                        pass
             self.currentRxNotifyStateFlag = False
 
     def _callbackForRxChannels(self, BleakGATTChar, rxBytes):
@@ -400,20 +413,39 @@ async def main():
         print(" -do not accept any pairing dialog until you selected your device in the following list\n")
         bleAddr = await selectBLEdevices()
 
-    bleClient = bleak.BleakClient(bleAddr)
+    bleClient = None
     _linux_agent_bus = None
     try:
         if sys.platform == "linux":
-            # Register NoInputNoOutput agent BEFORE connecting so BlueZ uses it when the
-            # device sends its Security Request (~90 ms after connection).  This prevents
-            # the User Confirmation Request that otherwise blocks Just Works pairing.
+            # Register NoInputNoOutput agent BEFORE connecting
             _linux_agent_bus = await _linux_register_pairing_agent()
-        logger.info(f"Attempt connecting to {bleAddr}.")
-        await bleClient.connect()
+        
+        logger.info(f"Attempting to find and connect to {bleAddr}...")
+        
+        # Fresh scan to get a valid BLEDevice object (fixes 'device not found' error)
+        device = await bleak.BleakScanner.find_device_by_address(bleAddr, timeout=10.0)
+        if device is None:
+            logger.error(f"Could not find device {bleAddr} during scan. Make sure it is in pairing mode.")
+            return
+
+        bleClient = bleak.BleakClient(device, timeout=20.0)
+        
+        for i in range(3):
+            try:
+                logger.info(f"Connection attempt {i+1}...")
+                await bleClient.connect()
+                break
+            except Exception as e:
+                if i < 2:
+                    logger.warning(f"Connection failed: {e}. Retrying in 2s...")
+                    await asyncio.sleep(2.0)
+                else:
+                    raise
+
         # Allow time for the SMP exchange (triggered by the device's Security Request) to
         # complete now that the NoInputNoOutput agent is registered.
         # On some systems (like Raspberry Pi 5), GATT service discovery can take a bit longer.
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(3.0)
         if sys.platform != "linux":
             try:
                 await bleClient.pair(protection_level = 2)
@@ -425,21 +457,33 @@ async def main():
         
         #verify that the device is an omron device by checking presence of certain bluetooth services
         found_services = []
-        for i in range(5):
-            found_services = [service.uuid for service in bleClient.services]
-            if parentService_UUID in found_services:
-                break
-            logger.info(f"Waiting for Omron service {parentService_UUID} (found {len(found_services)} services so far)...")
+        for i in range(10):
+            if not bleClient.is_connected:
+                logger.warning("Device disconnected, attempting to reconnect...")
+                try:
+                    await bleClient.connect()
+                    await asyncio.sleep(2.0)
+                except Exception as e:
+                    logger.debug(f"Reconnection attempt failed: {e}")
+
+            try:
+                found_services = [service.uuid for service in bleClient.services]
+                if any(uuid in found_services for uuid in parentService_UUIDs):
+                    break
+            except Exception as e:
+                logger.debug(f"Service discovery attempt {i} failed: {e}")
+
+            logger.info(f"Waiting for Omron service(s) {parentService_UUIDs} (found {len(found_services)} services so far)...")
             await asyncio.sleep(1.0)
 
-        if parentService_UUID not in found_services:
-            logger.error(f"Required Omron service {parentService_UUID} not found.")
+        if not any(uuid in found_services for uuid in parentService_UUIDs):
+            logger.error(f"Required Omron service from {parentService_UUIDs} not found.")
             logger.error(f"Discovered services: {found_services}")
             if deviceSpecific is not None:
                 logger.warning(f"Proceeding anyway as a specific device driver ({deviceName}) is loaded and might use direct handles.")
             else:
                 raise OSError(f"""Some required bluetooth attributes not found on this ble device.
-                                 Expected service {parentService_UUID} not found.
+                                 Expected service from {parentService_UUIDs} not found.
                                  This means that either, you connected to a wrong device,
                                  or that your OS has a bug when reading BT LE device attributes (certain linux versions).""")
 

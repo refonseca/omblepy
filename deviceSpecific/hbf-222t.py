@@ -2,25 +2,9 @@
 hbf-222t.py  — Omron HBF-222T Body Composition Scale driver for omblepy
 
 BLE transport: 4-channel parallel notifications.
-  TX primary : handle 0x0321  (Write Without Response)
-  RX channels: 0x0361 / 0x0371 / 0x0381 / 0x0391  (16 bytes each per fragment)
-  Unlock     : handle 0x0311  (Write Request; response via Notify on same handle)
-
-EEPROM record layout – 64-byte stride starting at 0x02C0:
-  bytes  0-27  type-1: marker byte 0x5E/0x5F, visceral_fat at byte 3 (uint8)
-  bytes 28-55  type-2: marker = 0xFF 0xFF (record present),
-                       fat_mass×100 at bytes 20-21 (uint16 BE),
-                       weight×100   at bytes 22-23 (uint16 BE)
-  bytes 56-63  unused gap
-
-User profile (height) is read from EEPROM 0x01D0 (48 bytes, 24 bytes per user).
-Datetime is recovered by scanning each record for a plausible yy-mm-dd HH:MM:SS
-six-byte sequence.
-
-Derived fields
-  fat_pct = fat_mass / weight × 100
-  bmi     = weight / (height_m)²
-  bmr     = 363 + 21.6 × (weight - fat_mass)   (Katch-McArdle, verified against app)
+  TX primary : db5b55e0-aee7-11e1-965e-0002a5d5c51b
+  RX channels: 49123040 / 4d0bf320 / 5128ce60 / 560f1420
+  Unlock     : b305b680-aee7-11e1-a730-0002a5d5c51b
 """
 
 import sys
@@ -70,48 +54,73 @@ def _scan_datetime(data: bytes) -> datetime.datetime | None:
 class _HBF222TTransport:
     """Multi-channel BLE transport for the HBF-222T."""
 
-    H_UNLOCK    = 0x0311
-    H_TX        = 0x0321
-    _RX_LIST    = [0x0361, 0x0371, 0x0381, 0x0391]
+    U_UNLOCK    = "b305b680-aee7-11e1-a730-0002a5d5c51b"
+    U_TX        = "db5b55e0-aee7-11e1-965e-0002a5d5c51b"
+    _RX_LIST    = [
+        "49123040-aee8-11e1-a74d-0002a5d5c51b",
+        "4d0bf320-aee8-11e1-a0d9-0002a5d5c51b",
+        "5128ce60-aee8-11e1-b84b-0002a5d5c51b",
+        "560f1420-aee8-11e1-8184-0002a5d5c51b"
+    ]
     _UNLOCK_KEY = bytes.fromhex("a635f6b5d2f947a3a7a3ebcd6b2ae964")
 
     def __init__(self, client):
         self._c = client
-        self._q = {h: asyncio.Queue() for h in self._RX_LIST}
+        self._q = {u: asyncio.Queue() for u in self._RX_LIST}
 
-    def _mk_cb(self, h):
+    def _mk_cb(self, u):
         def cb(_, data):
-            logger.debug(f"  rxh=0x{h:04x} {bytes(data).hex()}")
-            self._q[h].put_nowait(bytes(data))
+            logger.debug(f"  rxu={u[:8]}... {bytes(data).hex()}")
+            self._q[u].put_nowait(bytes(data))
         return cb
 
     async def open(self):
-        for h in self._RX_LIST:
-            while not self._q[h].empty():
-                self._q[h].get_nowait()
-            await self._c.start_notify(h, self._mk_cb(h))
+        logger.debug("HBF-222T: Opening RX channels...")
+        for u in self._RX_LIST:
+            while not self._q[u].empty():
+                self._q[u].get_nowait()
+            await self._c.start_notify(u, self._mk_cb(u))
+        await asyncio.sleep(1.0)
         logger.debug("HBF-222T: RX channels open")
 
     async def close(self):
-        for h in self._RX_LIST:
+        for u in self._RX_LIST:
             try:
-                await self._c.stop_notify(h)
+                await self._c.stop_notify(u)
             except Exception:
                 pass
 
-    async def _wait(self, h: int, timeout: float = 5.0) -> bytes:
-        return await asyncio.wait_for(self._q[h].get(), timeout=timeout)
+    async def _wait_any(self, timeout: float = 10.0) -> bytes:
+        """Wait for a notification on ANY of the 4 RX channels."""
+        tasks = [asyncio.create_task(self._q[u].get()) for u in self._RX_LIST]
+        try:
+            done, pending = await asyncio.wait(tasks, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+            for p in pending:
+                p.cancel()
+            if not done:
+                raise asyncio.TimeoutError("Timeout waiting for any RX channel")
+            return list(done)[0].result()
+        except Exception:
+            for t in tasks: t.cancel()
+            raise
 
-    async def _xact(self, cmd: bytes, timeout: float = 5.0) -> bytes:
+    async def _xact(self, cmd: bytes, timeout: float = 10.0) -> bytes:
         """Send command on TX handle and assemble the multi-fragment response."""
-        logger.debug(f"  txh=0x{self.H_TX:04x} {cmd.hex()}")
-        await self._c.write_gatt_char(self.H_TX, cmd, response=False)
-        f0 = await self._wait(self._RX_LIST[0], timeout)
-        n  = math.ceil(f0[0] / 16)
+        logger.debug(f"  txu={self.U_TX[:8]}... {cmd.hex()}")
+        # Revert to response=False as per HBF hardware behavior
+        await self._c.write_gatt_char(self.U_TX, cmd, response=False)
+        
+        f0 = await self._wait_any(timeout)
+        total_len = f0[0]
+        n  = math.ceil(total_len / 16)
         buf = bytearray(f0)
-        for i in range(1, n):
-            buf.extend(await self._wait(self._RX_LIST[i], timeout))
-        return bytes(buf[:f0[0]])
+        
+        # If more fragments are needed, we might need to wait on specific queues
+        # but for simple commands like start_tx, it's usually 1 fragment.
+        while len(buf) < total_len:
+             buf.extend(await self._wait_any(timeout))
+             
+        return bytes(buf[:total_len])
 
     async def unlock(self):
         logger.debug("HBF-222T: unlock")
@@ -120,23 +129,27 @@ class _HBF222TTransport:
         def _cb(_, data):
             q.put_nowait(bytes(data))
 
-        await self._c.start_notify(self.H_UNLOCK, _cb)
+        await self._c.start_notify(self.U_UNLOCK, _cb)
         try:
             await self._c.write_gatt_char(
-                self.H_UNLOCK, bytes([0x01]) + self._UNLOCK_KEY, response=True)
+                self.U_UNLOCK, bytes([0x01]) + self._UNLOCK_KEY, response=True)
             try:
-                resp = await asyncio.wait_for(q.get(), timeout=2.0)
+                resp = await asyncio.wait_for(q.get(), timeout=3.0)
                 if resp[0] != 0x81:
                     logger.warning(f"HBF-222T: unexpected unlock response {resp.hex()}")
+                logger.debug("HBF-222T: unlock successful, waiting for stabilization...")
+                await asyncio.sleep(2.0)
             except asyncio.TimeoutError:
                 logger.warning("HBF-222T: unlock response timed out, continuing")
         finally:
             try:
-                await self._c.stop_notify(self.H_UNLOCK)
+                await self._c.stop_notify(self.U_UNLOCK)
             except Exception:
                 pass
 
     async def start_tx(self):
+        # Envia o comando de início. Alguns modelos precisam de uma pequena pausa antes.
+        await asyncio.sleep(1.0)
         resp = await self._xact(bytes.fromhex("0800000000100018"))
         logger.debug(f"HBF-222T: start_tx resp {resp.hex()}")
 
@@ -169,7 +182,7 @@ class deviceSpecificDriver(sharedDeviceDriverCode):
     _MAX_RECORDS             = 60
     _EEPROM_RECORDS_BASE     = 0x02C0
     _EEPROM_PROFILE_ADDR     = 0x01D0
-    _EEPROM_PROFILE_SIZE     = 48       # covers users 1 and 2
+    _EEPROM_PROFILE_SIZE     = 48
     _PROFILE_USER_STRIDE     = 24
     _RECORD_STRIDE           = 64
     _T1_SIZE                 = 28
@@ -231,9 +244,13 @@ class deviceSpecificDriver(sharedDeviceDriverCode):
         ble = omblepy_mod.bleClient
 
         tp = _HBF222TTransport(ble)
+        
+        # IMPORTANTE: Desbloquear ANTES de ativar notificações de RX
+        # Isso garante que a balança aceite a mudança de estado
+        await tp.unlock()
+        
         await tp.open()
         try:
-            await tp.unlock()
             await tp.start_tx()
 
             profile   = await tp.read_eeprom(self._EEPROM_PROFILE_ADDR, self._EEPROM_PROFILE_SIZE)
