@@ -27,17 +27,19 @@ def convertByteArrayToHexString(array):
 
 
 class bluetoothTxRxHandler:
-    #BTLE Characteristic IDs
+    # BTLE Characteristic IDs
     deviceRxChannelUUIDs  = [
-                                "49123040-aee8-11e1-a74d-0002a5d5c51b",
-                                "4d0bf320-aee8-11e1-a0d9-0002a5d5c51b",
-                                "5128ce60-aee8-11e1-b84b-0002a5d5c51b",
-                                "560f1420-aee8-11e1-8184-0002a5d5c51b"
-                            ]
+        "49123040-aee8-11e1-a74d-0002a5d5c51b",
+        "4d0bf320-aee8-11e1-a0d9-0002a5d5c51b",
+        "5128ce60-aee8-11e1-b84b-0002a5d5c51b",
+        "560f1420-aee8-11e1-8184-0002a5d5c51b"
+    ]
     deviceTxChannelUUIDs  = [
-                                "db5b55e0-aee7-11e1-965e-0002a5d5c51b"
-                            ]
-    deviceDataRxChannelIntHandles = [31]
+        "db5b55e0-aee7-11e1-965e-0002a5d5c51b",
+        "e0b8a060-aee7-11e1-92f4-0002a5d5c51b",
+        "0ae12b00-aee8-11e1-a192-0002a5d5c51b",
+        "10e1ba60-aee8-11e1-89e5-0002a5d5c51b"
+    ]
     deviceUnlock_UUID         = "b305b680-aee7-11e1-a730-0002a5d5c51b"
 
     def __init__(self, pairing = False):
@@ -46,6 +48,8 @@ class bluetoothTxRxHandler:
         self.rxEepromAddress            = None
         self.rxDataBytes                = None
         self.rxFinishedFlag             = False
+        self._rxBuffer                  = bytearray()
+        self._expectedTotalLen          = 0
 
     async def _enableRxChannelNotifyAndCallback(self):
         if(self.currentRxNotifyStateFlag != True):
@@ -67,38 +71,65 @@ class bluetoothTxRxHandler:
             self.currentRxNotifyStateFlag = False
 
     def _callbackForRxChannels(self, BleakGATTChar, rxBytes):
-        logger.debug(f"rx ch0 < {convertByteArrayToHexString(rxBytes)}")
-        packetSize = rxBytes[0]
+        logger.debug(f"rx {BleakGATTChar.uuid[:8]} < {convertByteArrayToHexString(rxBytes)}")
+        
+        if not self._rxBuffer:
+            self._expectedTotalLen = rxBytes[0]
+        
+        self._rxBuffer.extend(rxBytes)
+        
+        if len(self._rxBuffer) < self._expectedTotalLen:
+            # More fragments expected
+            return
+
+        # We have the full packet
+        buf = self._rxBuffer[:self._expectedTotalLen]
+        self._rxBuffer = bytearray() # Clear for next transaction
+        
         xorCrc = 0
-        for byte in rxBytes:
+        for byte in buf:
             xorCrc ^= byte
         if(xorCrc):
-            raise ValueError(f"data corruption in rx\ncrc: {xorCrc}\ncombniedBuffer: {convertByteArrayToHexString(rxBytes)}")
+            logger.error(f"data corruption in rx\ncrc: {xorCrc}\ncombinedBuffer: {convertByteArrayToHexString(buf)}")
+            # Even if corrupted, mark as finished to avoid hanging
+            self.rxFinishedFlag = True
             return
-        #extract information
-        self.rxPacketType       = rxBytes[1:3]
-        self.rxEepromAddress    = rxBytes[3:5]
-        expectedNumDataBytes    = rxBytes[5]
-        if(expectedNumDataBytes > (len(rxBytes) - 8)):
+            
+        # extract information from combined buffer
+        self.rxPacketType       = buf[1:3]
+        self.rxEepromAddress    = buf[3:5]
+        expectedNumDataBytes    = buf[5]
+        
+        if(expectedNumDataBytes > (len(buf) - 8)):
             self.rxDataBytes    = bytes(b'\xff') * expectedNumDataBytes
         else:
-            if(self.rxPacketType) == bytearray.fromhex("8f00"): #need special case for end of transmission packet, otherwise transmission error code is not accessible
-                self.rxDataBytes = rxBytes[6:7]
+            if(self.rxPacketType) == bytearray.fromhex("8f00"): # need special case for end of transmission packet
+                self.rxDataBytes = buf[6:7]
             else:
-                self.rxDataBytes    = rxBytes[6: 6 + expectedNumDataBytes]
+                self.rxDataBytes    = buf[6: 6 + expectedNumDataBytes]
+        
         self.rxFinishedFlag     = True
-        return
 
-    async def _waitForRxOrRetry(self, command, timeoutS = 1.0):
+    async def _waitForRxOrRetry(self, command, timeoutS = 3.0):
         self.rxFinishedFlag = False
+        self._rxBuffer = bytearray()
         retries = 0
         while True:
-            await bleClient.write_gatt_char(self.deviceTxChannelUUIDs[0], command)
+            # Split command across TX channels if needed (16 bytes per channel)
+            # This is observed on HBF scales for 40-byte commands.
+            for i in range(0, len(command), 16):
+                u_idx = (i // 16) % len(self.deviceTxChannelUUIDs)
+                u = self.deviceTxChannelUUIDs[u_idx]
+                chunk = command[i:i+16]
+                is_last = (i + 16 >= len(command))
+                # Omron Connect uses WRITE_REQ for fragments and WRITE_CMD for last chunk
+                # Some devices might prefer WRITE_CMD throughout.
+                await bleClient.write_gatt_char(u, chunk, response=not is_last)
 
             currentTimeout = timeoutS
             while(self.rxFinishedFlag == False):
-                await asyncio.sleep(0.1)
-                currentTimeout -= 0.1
+                await asyncio.sleep(0.05) # Shorter sleep for better latency
+                currentTimeout -= 0.05
                 if(currentTimeout < 0):
                     break
             if(currentTimeout >= 0):
@@ -106,8 +137,8 @@ class bluetoothTxRxHandler:
             retries += 1
             logger.warning(f"Transmission failed, count of retries: {retries} / 5")
             if(retries >= 5):
-                ValueError("Same transmission failed 5 times, abort")
-                return
+                raise ValueError("Same transmission failed 5 times, abort")
+
 
     async def startTransmission(self):
         await self._enableRxChannelNotifyAndCallback()
@@ -260,7 +291,7 @@ def appendCsv(allRecords):
                 writer.writerow(recordDict)
 
 def saveUBPMJson(allRecords):
-    has_bp = any('sys' in rec for user in allRecords for rec in user)
+    has_bp = any(rec.get('sys') for user in allRecords for rec in user)
     if not has_bp:
         logger.info("Device does not produce blood-pressure records; skipping UBPM JSON.")
         return
@@ -270,6 +301,8 @@ def saveUBPMJson(allRecords):
     for userIdx in range(len(allRecords)):
         UBPM["UBPM"][f"U{userIdx+1}"] = []
         for rec in allRecords[userIdx]:
+            if not rec.get('sys'):
+                continue
             recdate=datetime.datetime.strptime(rec["datetime"], "%Y-%m-%d %H:%M:%S")
             UBPM["UBPM"][f"U{userIdx+1}"].append({
                                 "date": recdate.strftime("%d.%m.%Y"),
@@ -343,6 +376,18 @@ async def _linux_register_pairing_agent():
     except Exception as e:
         logger.warning(f"Could not register BlueZ pairing agent: {e}")
         return None
+
+async def _linux_cleanup_device(address):
+    """Try to remove the device from BlueZ to clear stale state."""
+    try:
+        import subprocess
+        logger.info(f"Linux/BlueZ: Cleaning up device {address}...")
+        subprocess.run(["bluetoothctl", "remove", address], capture_output=True, text=True)
+        await asyncio.sleep(1.0)
+        subprocess.run(["bluetoothctl", "trust", address], capture_output=True, text=True)
+        await asyncio.sleep(1.0)
+    except Exception as e:
+        logger.debug(f"Cleanup failed: {e}")
 
 async def selectBLEdevices():
     print("Select your Omron device from the list below...")
@@ -422,23 +467,59 @@ async def main():
         
         logger.info(f"Attempting to find and connect to {bleAddr}...")
         
-        # Fresh scan to get a valid BLEDevice object (fixes 'device not found' error)
-        device = await bleak.BleakScanner.find_device_by_address(bleAddr, timeout=10.0)
-        if device is None:
-            logger.error(f"Could not find device {bleAddr} during scan. Make sure it is in pairing mode.")
-            return
+        # Initial cleanup only if requested or as a one-time thing at start
+        # but let's avoid it if possible, or do it before any scan.
+        if sys.platform == "linux":
+             # Optional: only remove if we are having persistent issues.
+             # For now, let's try WITHOUT removing every time.
+             # await _linux_cleanup_device(bleAddr) 
+             pass
 
-        bleClient = bleak.BleakClient(device, timeout=20.0)
-        
-        for i in range(3):
+        for i in range(5):
             try:
+                logger.info(f"Scanning for {bleAddr} (attempt {i+1})...")
+                # find_device_by_address helps ensure the device is actually advertising
+                device = await bleak.BleakScanner.find_device_by_address(bleAddr, timeout=15.0)
+                if device is None:
+                    logger.warning(f"Could not find device {bleAddr} during scan. Make sure it is in pairing/transfer mode.")
+                    await asyncio.sleep(2.0)
+                    continue
+                
+                # Use a shorter connection timeout to fail faster and retry
+                bleClient = bleak.BleakClient(device, timeout=15.0)
+
                 logger.info(f"Connection attempt {i+1}...")
                 await bleClient.connect()
+                logger.info("Connection established, waiting for services...")
+                
+                # On Linux, pairing helps with encrypted characteristics
+                if sys.platform == "linux":
+                    try:
+                        logger.info("Linux: Attempting explicit pairing (Just Works)...")
+                        await bleClient.pair(protection_level = 2)
+                        await asyncio.sleep(1.0)
+                    except Exception as e:
+                        logger.debug(f"Pairing info/error: {e}")
+                
+                # Check services
+                found_services = [s.uuid for s in bleClient.services]
+                logger.debug(f"Services found: {found_services}")
                 break
+
             except Exception as e:
-                if i < 2:
-                    logger.warning(f"Connection failed: {e}. Retrying in 2s...")
-                    await asyncio.sleep(2.0)
+                logger.warning(f"Connection attempt {i+1} failed: {e}")
+                if bleClient:
+                    try: await bleClient.disconnect()
+                    except: pass
+                
+                if i < 4:
+                    if "device disconnected" in str(e) or "Timeout" in str(e):
+                        if sys.platform == "linux":
+                            logger.info("Linux: Performing emergency device cleanup and retrying...")
+                            await _linux_cleanup_device(bleAddr)
+                    
+                    logger.info("Waiting 5s before next attempt...")
+                    await asyncio.sleep(5.0)
                 else:
                     raise
 
@@ -509,7 +590,7 @@ async def main():
             except Exception:
                 pass
         logger.info("unpair and disconnect")
-        if bleClient.is_connected:
+        if bleClient is not None and bleClient.is_connected:
             try:
                 await bleClient.unpair()
             except Exception as e:
