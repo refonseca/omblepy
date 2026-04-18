@@ -1,0 +1,4 @@
+picamera==1.13
+protobuf==3.14.0
+pyzbar==0.1.8
+RPi.GPIO==0.7.0

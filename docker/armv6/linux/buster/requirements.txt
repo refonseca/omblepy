@@ -1,0 +1,9 @@
+picamera==1.13
+protobuf==3.14.0
+pyzbar==0.1.8
+RPi.GPIO==0.7.0
+google-cloud-storage~=1.37.1
+google-api-python-client~=2.1.0
+google
+opencv-python~=4.5.1.48
+numpy~=1.19.5
