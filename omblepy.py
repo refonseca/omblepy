@@ -71,27 +71,39 @@ class bluetoothTxRxHandler:
             self.currentRxNotifyStateFlag = False
 
     def _callbackForRxChannels(self, BleakGATTChar, rxBytes):
-        logger.debug(f"rx {BleakGATTChar.uuid[:8]} < {convertByteArrayToHexString(rxBytes)}")
+        # Determine channel index
+        try:
+            ch_idx = self.deviceRxChannelUUIDs.index(BleakGATTChar.uuid)
+        except ValueError:
+            return
+
+        logger.debug(f"rx ch{ch_idx} < {convertByteArrayToHexString(rxBytes)}")
         
-        if not self._rxBuffer:
+        # Start of a new packet always comes on ch0
+        if ch_idx == 0:
+            self._rxBuffer = bytearray(rxBytes)
             self._expectedTotalLen = rxBytes[0]
-        
-        self._rxBuffer.extend(rxBytes)
+            self._next_expected_ch = 1
+        else:
+            # Append fragments in sequence
+            if hasattr(self, '_rxBuffer') and self._rxBuffer and ch_idx == self._next_expected_ch:
+                self._rxBuffer.extend(rxBytes)
+                self._next_expected_ch = (self._next_expected_ch + 1) % len(self.deviceRxChannelUUIDs)
+            else:
+                return
         
         if len(self._rxBuffer) < self._expectedTotalLen:
-            # More fragments expected
             return
 
         # We have the full packet
-        buf = self._rxBuffer[:self._expectedTotalLen]
-        self._rxBuffer = bytearray() # Clear for next transaction
+        buf = bytes(self._rxBuffer[:self._expectedTotalLen])
+        self._rxBuffer = bytearray() 
         
         xorCrc = 0
         for byte in buf:
             xorCrc ^= byte
         if(xorCrc):
-            logger.error(f"data corruption in rx\ncrc: {xorCrc}\ncombinedBuffer: {convertByteArrayToHexString(buf)}")
-            # Even if corrupted, mark as finished to avoid hanging
+            logger.error(f"data corruption in rx (CRC mismatch)\ncrc: {xorCrc}\ncombinedBuffer: {convertByteArrayToHexString(buf)}")
             self.rxFinishedFlag = True
             return
             
@@ -100,13 +112,13 @@ class bluetoothTxRxHandler:
         self.rxEepromAddress    = buf[3:5]
         expectedNumDataBytes    = buf[5]
         
-        if(expectedNumDataBytes > (len(buf) - 8)):
-            self.rxDataBytes    = bytes(b'\xff') * expectedNumDataBytes
+        if(self.rxPacketType == bytearray.fromhex("8f00")):
+            # Special case: Status response often has data count 0 but status at byte 6
+            self.rxDataBytes = buf[6:7]
+        elif(expectedNumDataBytes > (len(buf) - 8)):
+            self.rxDataBytes = bytes(b'\xff') * expectedNumDataBytes
         else:
-            if(self.rxPacketType) == bytearray.fromhex("8f00"): # need special case for end of transmission packet
-                self.rxDataBytes = buf[6:7]
-            else:
-                self.rxDataBytes    = buf[6: 6 + expectedNumDataBytes]
+            self.rxDataBytes = buf[6: 6 + expectedNumDataBytes]
         
         self.rxFinishedFlag     = True
 
@@ -115,20 +127,16 @@ class bluetoothTxRxHandler:
         self._rxBuffer = bytearray()
         retries = 0
         while True:
-            # Split command across TX channels if needed (16 bytes per channel)
-            # This is observed on HBF scales for 40-byte commands.
+            # Split command across TX channels if needed
             for i in range(0, len(command), 16):
                 u_idx = (i // 16) % len(self.deviceTxChannelUUIDs)
                 u = self.deviceTxChannelUUIDs[u_idx]
                 chunk = command[i:i+16]
-                is_last = (i + 16 >= len(command))
-                # Omron Connect uses WRITE_REQ for fragments and WRITE_CMD for last chunk
-                # Some devices might prefer WRITE_CMD throughout.
-                await bleClient.write_gatt_char(u, chunk, response=not is_last)
+                await bleClient.write_gatt_char(u, chunk, response=True)
 
             currentTimeout = timeoutS
             while(self.rxFinishedFlag == False):
-                await asyncio.sleep(0.05) # Shorter sleep for better latency
+                await asyncio.sleep(0.05)
                 currentTimeout -= 0.05
                 if(currentTimeout < 0):
                     break
@@ -151,11 +159,13 @@ class bluetoothTxRxHandler:
         stopDataReadout         = bytearray.fromhex("080f000000000007")
         await self._waitForRxOrRetry(stopDataReadout)
         if(self.rxPacketType != bytearray.fromhex("8f00")):
-            raise ValueError("invlid response to data readout end")
+            logger.warning("invalid response to data readout end")
             return
-        if(self.rxDataBytes[0]):
-            raise ValueError(f"Device reported error status code {self.rxDataBytes[0]} while sending endTransmission command.")
-            return
+        # Status 229 (0xE5) or 0 is normal for HBF-222T session closure
+        if len(self.rxDataBytes) > 0:
+            status = self.rxDataBytes[0]
+            if status != 0 and status != 229:
+                logger.warning(f"Device reported error status code {status} during disconnect.")
         await self._disableRxChannelNotifyAndCallback()
 
     async def _writeBlockEeprom(self, address, dataByteArray):
@@ -282,7 +292,8 @@ def appendCsv(allRecords):
             first_keys = list(allRecords[userIdx][0].keys())
             csv_fieldnames = ["datetime"] + [k for k in first_keys if k != "datetime"]
         else:
-            csv_fieldnames = ["datetime", "dia", "sys", "bpm", "mov", "ihb"]
+            # Default headers for Scale if not found
+            csv_fieldnames = ["datetime", "weight", "fat_pct", "fat_mass", "visceral_fat", "bmi", "bmr"]
         with open(f"user{userIdx+1}.csv", mode='w', newline='', encoding='utf-8') as outfile:
             writer = csv.DictWriter(outfile, fieldnames=csv_fieldnames, extrasaction='ignore')
             writer.writeheader()
@@ -407,13 +418,20 @@ async def selectBLEdevices():
 async def main():
     global bleClient
     global deviceSpecific
-    parser = argparse.ArgumentParser(description="python tool to read the records of omron blood pressure instruments")
+    parser = argparse.ArgumentParser(description="python tool to read the records of omron scale/blood pressure instruments")
     parser.add_argument('-d', "--device",     required="true", type=ascii,  help="Device name (e.g. HEM-7322T-D).")
     parser.add_argument("--loggerDebug",      action="store_true",          help="Enable verbose logger output")
     parser.add_argument("-p", "--pair",       action="store_true",          help="Programm the pairing key into the device. Needs to be done only once.")
     parser.add_argument("-m", "--mac",                          type=ascii, help="Bluetooth Mac address of the device (e.g. 00:1b:63:84:45:e6). If not specified, will scan for devices and display a selection dialog.")
     parser.add_argument('-n', "--newRecOnly", action="store_true",          help="Considers the unread records counter and only reads new records. Resets these counters afterwards. If not enabled, all records are read and the unread counters are not cleared.")
     parser.add_argument('-t', "--timeSync",   action="store_true",          help="Update the time on the omron device by using the current system time.")
+    
+    # New registration arguments
+    parser.add_argument("--register",         type=int, choices=[1, 2, 3, 4], help="Register a user profile (1-4) with provided parameters.")
+    parser.add_argument("--birth",            type=str,                     help="Birthdate for registration (YYYY-MM-DD).")
+    parser.add_argument("--height",           type=float,                   help="Height in cm (e.g. 171.3).")
+    parser.add_argument("--gender",           type=str, choices=['M', 'F'], help="Gender (M or F).")
+    
     args = parser.parse_args()
 
     #setup logging
@@ -576,6 +594,22 @@ async def main():
             #this seems to be necessary when the device has not been paired to any device
             await bluetoothTxRxObj.startTransmission()
             await bluetoothTxRxObj.endTransmission()
+        elif args.register:
+             logger.info(f"Starting registration for User {args.register}")
+             devSpecificDriver = deviceSpecific.deviceSpecificDriver()
+             # Convert birth string to tuple (Y, M, D) if provided
+             birth_tuple = None
+             if args.birth:
+                 dt = datetime.datetime.strptime(args.birth, "%Y-%m-%d")
+                 birth_tuple = (dt.year, dt.month, dt.day)
+             
+             await devSpecificDriver.registerUser(
+                 btobj = bluetoothTxRxObj, 
+                 user_id = args.register,
+                 birthdate = birth_tuple,
+                 height = args.height,
+                 gender = args.gender
+             )
         else:
             logger.info("communication started")
             devSpecificDriver = deviceSpecific.deviceSpecificDriver()
@@ -605,4 +639,5 @@ async def main():
             except Exception as e:
                 logger.error(f"Disconnect failed: {e}")
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())

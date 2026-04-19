@@ -2,112 +2,32 @@ import sys
 import asyncio
 import struct
 import datetime
-import math
 import logging
-from bleak.exc import BleakError
-
-logger = logging.getLogger("omblepy")
-sys.path.append('..')
 from sharedDriver import sharedDeviceDriverCode
 
-
-# ── User Profiles ──────────────────────────────────────────────────────────
-
-class UserProfile:
-    def __init__(self, birthdate, height, gender):
-        self.birthdate = birthdate # (Y, M, D)
-        self.height = height
-        self.gender = gender # "M" or "F"
-
-# Profiles confirmed by user
-PROFILES = {
-    1: UserProfile((1979, 12, 25), 171, "M"),
-    2: UserProfile((1979, 9, 22), 155, "F"),
-    3: UserProfile((1996, 1, 1), 160, "M"),
-}
-
-# ── Low-level helpers ──────────────────────────────────────────────────────────
-
-def _xor(data) -> int:
-    r = 0
-    for b in data:
-        r ^= b
-    return r
-
-
-def _read_cmd(addr: int, n: int, chunk_n: int = None, state: bytes = None) -> bytes:
-    if addr > 0x0200:
-        if chunk_n is None: chunk_n = n
-        length = 40
-        c = bytearray([length, 0x01, addr & 0xFF, (addr >> 8) & 0xFF, n & 0xFF, chunk_n & 0xFF])
-        if state and len(state) >= 24:
-            c += state[:24]
-        else:
-            c += bytearray([0] * 24)
-        if len(c) < 30:
-            c += bytearray([0] * (30 - len(c)))
-        now = datetime.datetime.now()
-        c += bytearray([now.year - 2000, now.month, now.day, now.hour, now.minute, now.second])
-        c = c[:39]
-        if len(c) < 39:
-            c += bytearray([0] * (39 - len(c)))
-        c.append(_xor(c))
-        return bytes(c)
-    else:
-        c = bytearray([0x08, 0x01, 0x00, (addr >> 8) & 0xFF, addr & 0xFF, n & 0xFF])
-        c += bytes([0x00, _xor(c)])
-        return bytes(c)
-
-
-def _scan_datetime(data: bytes) -> datetime.datetime | None:
-    """Return first plausible 6-byte [yy mm dd HH MM SS] datetime found in data."""
-    # Method 1: Check for raw byte-aligned date (Type 1: 0x60)
-    for i in range(len(data) - 5):
-        yy, mo, dd, hh, mi, ss = data[i:i+6]
-        yr = yy + 2000
-        if (2020 <= yr <= 2035 and 1 <= mo <= 12 and 1 <= dd <= 31
-                and 0 <= hh <= 23 and 0 <= mi <= 59 and ss <= 60):
-            try:
-                return datetime.datetime(yr, mo, dd, hh, mi, min(ss, 59))
-            except ValueError:
-                continue
-
-    # Method 2: Check for XOR-encrypted date (Type 2: 0x5E)
-    # Observed XOR key: f6 47 d9 6f 71 4f
-    if data[0] == 0x5E and len(data) >= 7:
-        key = [0xf6, 0x47, 0xd9, 0x6f, 0x71, 0x4f]
-        yy = data[1] ^ key[0]
-        mo = data[2] ^ key[1]
-        dd = data[3] ^ key[2]
-        hh = data[4] ^ key[3]
-        mi = data[5] ^ key[4]
-        ss = data[6] ^ key[5]
-        yr = yy + 2000
-        if (2020 <= yr <= 2035 and 1 <= mo <= 12 and 1 <= dd <= 31
-                and 0 <= hh <= 23 and 0 <= mi <= 59 and ss <= 60):
-            try:
-                return datetime.datetime(yr, mo, dd, hh, mi, min(ss, 59))
-            except ValueError:
-                pass
-    return None
-
-
-# ── Device driver ──────────────────────────────────────────────────────────────
+logger = logging.getLogger("omblepy")
 
 class deviceSpecificDriver(sharedDeviceDriverCode):
-    """Omron HBF-222T body-composition scale driver supporting 3 user profiles."""
+    """
+    Driver HBF-222T: Implementação definitiva com suporte a histórico longo e precisão de segundos.
+    """
 
-    deviceEndianess          = "big"
-    _MAX_RECORDS             = 120 # Increased to cover more history
-    _EEPROM_BASE_ADDR        = 0x01A0 # Start from headers to get Type-1 records
-    _RECORD_STRIDE           = 32
+    deviceEndianess = "big"
+    
+    # Endereços base oficiais
+    PROFILES = [
+        (1, 0x02C0),
+        (2, 0x06A0),
+        (3, 0x0A80),
+        (4, 0x0E60)
+    ]
 
     def __init__(self):
         super().__init__()
-        self._session_state = None
+        self.recordByteSize = 32
 
     async def _custom_unlock(self, btobj):
-        logger.debug("HBF-222T: performing custom unlock")
+        logger.debug("HBF-222T: handshake de desbloqueio")
         omblepy_mod = sys.modules.get("omblepy") or sys.modules["__main__"]
         ble = omblepy_mod.bleClient
         unlock_key = bytes.fromhex("a635f6b5d2f947a3a7a3ebcd6b2ae964")
@@ -115,97 +35,85 @@ class deviceSpecificDriver(sharedDeviceDriverCode):
         def _cb(_, data): q.put_nowait(bytes(data))
         try:
             await ble.start_notify(btobj.deviceUnlock_UUID, _cb)
-            await ble.write_gatt_char(btobj.deviceUnlock_UUID, bytes([0x02] + [0]*16), response=False)
+            await ble.write_gatt_char(btobj.deviceUnlock_UUID, bytes([0x02] + [0]*16), response=True)
             await asyncio.wait_for(q.get(), timeout=3.0)
-            await ble.write_gatt_char(btobj.deviceUnlock_UUID, bytes([0x01]) + unlock_key, response=False)
+            await ble.write_gatt_char(btobj.deviceUnlock_UUID, bytes([0x01]) + unlock_key, response=True)
             await asyncio.wait_for(q.get(), timeout=3.0)
         finally:
             try: await ble.stop_notify(btobj.deviceUnlock_UUID)
             except: pass
+
+    def _bits(self, raw, offset, n, start):
+        """Extrai n bits de um inteiro de 16 bits (Big Endian) no offset indicado."""
+        val = struct.unpack_from(">H", raw, offset)[0]
+        return (val >> start) & ((1 << n) - 1)
+
+    def decode(self, raw):
+        """Decodifica o bloco de 32 bytes da EEPROM com precisão de segundos."""
+        if len(raw) < 32 or raw[0:2] == b'\xff\xff':
+            return None
+        try:
+            # Métricas Vitais (Big Endian Bit-Packing)
+            weight   = self._bits(raw, 26, 12, 4) * 0.05
+            fat_pct  = self._bits(raw, 2,  10, 6) * 0.1
+            bmr      = self._bits(raw, 4,  12, 4)
+            muscle   = self._bits(raw, 6,  10, 6) * 0.1
+            bmi      = self._bits(raw, 8,  10, 6) * 0.1
+            visceral = raw[10] & 0x7F
+            body_age = (raw[11] >> 4) & 0x0F
+
+            # Timestamp Detalhado
+            year   = (raw[7]  & 0x3F) + 2000
+            month  = raw[11]  & 0x0F
+            day    = (raw[12] >> 3) & 0x1F
+            hour   = self._bits(raw, 12, 5, 6)
+            minute = raw[9]   & 0x3F
+            second = raw[13]  & 0x3F # Segundos identificados nos bits 0-5 do byte 13
+
+            if not (30.0 < weight < 200.0) or not (1 <= month <= 12):
+                return None
+
+            return {
+                "datetime": datetime.datetime(year, month, day, hour, minute, min(second, 59)),
+                "weight": round(weight, 2),
+                "fat_pct": round(fat_pct, 1),
+                "fat_mass": round(weight * fat_pct / 100.0, 2),
+                "muscle": round(muscle, 1),
+                "bmi": round(bmi, 1),
+                "visceral_fat": visceral,
+                "bmr": bmr,
+                "body_age": body_age
+            }
+        except Exception as e:
+            logger.debug(f"HBF-222T: erro no parsing: {e}")
+            return None
 
     async def getRecords(self, btobj, useUnreadCounter, syncTime):
         try:
             await self._custom_unlock(btobj)
             await btobj.startTransmission()
 
-            async def _read_eeprom(addr: int, size: int, block: int = 0x18) -> bytes:
-                out = bytearray()
-                while len(out) < size:
-                    n = min(size - len(out), block)
-                    cmd = _read_cmd(addr + len(out), n, chunk_n=n, state=self._session_state)
-                    await btobj._waitForRxOrRetry(cmd)
-                    chunk = btobj.rxDataBytes
-                    if not chunk: break
-                    out += chunk
-                    # Establish session state from the very first profile/header read
-                    if self._session_state is None and len(out) >= 24:
-                        self._session_state = bytes(out[:24])
-                return bytes(out)
+            user_records = {1: [], 2: [], 3: [], 4: []}
 
-            # Read a large block encompassing both latest headers and history
-            raw = await _read_eeprom(
-                self._EEPROM_BASE_ADDR,
-                self._MAX_RECORDS * self._RECORD_STRIDE,
-                block=0x20
-            )
-
-            # Map records by user and timestamp
-            type1_map = {} # dt -> (user_id, visceral)
-            type2_map = {} # dt -> (weight, fat_mass)
-            
-            for offset in range(0, len(raw), self._RECORD_STRIDE):
-                blk = raw[offset : offset + self._RECORD_STRIDE]
-                if len(blk) < 32 or blk[0] == 0xFF: continue
-                
-                dt = _scan_datetime(blk)
-                if not dt: continue
-                
-                if blk[0] == 0x60: # Type 1
-                    user_id = blk[1]
-                    visceral = blk[17]
-                    type1_map[dt] = (user_id, visceral)
-                elif blk[0] == 0x5E: # Type 2
-                    weight   = struct.unpack_from(">H", blk, 18)[0] / 100.0
-                    fat_mass = struct.unpack_from(">H", blk, 20)[0] / 100.0
-                    if weight > 0:
-                        type2_map[dt] = (weight, fat_mass)
-
-            user_records = {1: [], 2: [], 3: []}
-            
-            # Join Type-1 and Type-2 by matching timestamps
-            # (Works because we can now decrypt the Type-2 timestamp)
-            all_dts = sorted(set(type1_map.keys()) | set(type2_map.keys()))
-            for dt in all_dts:
-                if dt in type1_map and dt in type2_map:
-                    user_id, visceral = type1_map[dt]
-                    weight, fat_mass = type2_map[dt]
-                    profile = PROFILES.get(user_id)
-                    if not profile: continue
+            for uid, base_addr in self.PROFILES:
+                logger.info(f"Lendo histórico completo do Perfil {uid}...")
+                # Aumentado para 30 slots para capturar todas as medidas do print
+                for step in range(30):
+                    addr = base_addr + (step * 32)
+                    raw_data = await btobj.readContinuousEepromData(addr, 32, 32)
                     
-                    fat_pct = round((fat_mass / weight * 100.0), 1) if weight > 0 else 0
-                    lean_mass = weight - fat_mass
-                    bmr = round(363 + 21.6 * lean_mass)
-                    bmi = round(weight / ((profile.height/100.0)**2), 1)
+                    if not raw_data or all(b == 0xFF for b in raw_data):
+                        break
                     
-                    user_records[user_id].append({
-                        "datetime":     dt,
-                        "weight":       round(weight, 2),
-                        "fat_pct":      fat_pct,
-                        "fat_mass":     round(fat_mass, 2),
-                        "visceral_fat": visceral,
-                        "bmi":          bmi,
-                        "bmr":          bmr,
-                    })
+                    res = self.decode(raw_data)
+                    if res:
+                        user_records[uid].append(res)
+                        logger.info(f"OK P{uid}: {res['datetime']} -> {res['weight']}kg")
+                    await asyncio.sleep(0.02)
 
             await btobj.endTransmission()
-        except Exception as e:
-            logger.error(f"HBF-222T: getRecords failed: {e}")
-            raise
-
-        all_results = []
-        for i in range(1, 4):
-            recs = user_records[i]
-            logger.info(f"HBF-222T: User {i} - {len(recs)} record(s) found")
-            all_results.append(recs)
+            return [user_records[i] for i in range(1, 5)]
             
-        return all_results
+        except Exception as e:
+            logger.error(f"HBF-222T: falha: {e}")
+            raise
